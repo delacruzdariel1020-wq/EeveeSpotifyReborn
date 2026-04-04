@@ -41,24 +41,19 @@ jobs:
         id: get_release
         run: |
           echo "Buscando el ultimo release de EeveeSpotify..."
-          RELEASE_JSON=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases" \
-            -H "Authorization: Bearer ${{ github.token }}")
+          RELEASE_JSON=$(curl -s "https://api.github.com/repos/whoeevee/EeveeSpotify/releases/latest")
 
           # Buscar el .deb rootful (arm) del ultimo release
           DEB_URL=$(echo "$RELEASE_JSON" | jq -r '
-            [.[] | .assets[] | select(.name | test("iphoneos-arm\\.deb$"))]
-            | first | .browser_download_url
-          ')
+            .assets[] | select(.name | test("iphoneos-arm\\.deb$")) | .browser_download_url
+          ' | head -1)
 
           if [[ -z "$DEB_URL" || "$DEB_URL" == "null" ]]; then
-            echo "::error::No se encontro un .deb de EeveeSpotify en los releases. Asegurate de haber creado un release primero."
+            echo "::error::No se encontro un .deb de EeveeSpotify en el repo original."
             exit 1
           fi
 
-          RELEASE_VERSION=$(echo "$RELEASE_JSON" | jq -r '
-            [.[] | select(.assets[] | .name | test("iphoneos-arm\\.deb$"))]
-            | first | .tag_name
-          ')
+          RELEASE_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
 
           echo "DEB_URL=$DEB_URL" >> $GITHUB_ENV
           echo "EEVEESPOTIFY_VERSION=$RELEASE_VERSION" >> $GITHUB_ENV
