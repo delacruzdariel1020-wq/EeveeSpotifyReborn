@@ -104,16 +104,30 @@ jobs:
           sudo mv ipapatch.macos-arm64 /usr/local/bin/ipapatch
           sudo chmod +x /usr/local/bin/ipapatch
 
+      - name: Remove WatchKit app from IPA
+        run: |
+          mkdir spotify_extracted
+          cp spotify.ipa spotify_extracted/spotify.zip
+          cd spotify_extracted
+          unzip -q spotify.zip
+          # Eliminar la app de Apple Watch para evitar conflicto de bundle ID en Sideloadly
+          find . -name "*.app" -path "*/Watch/*" -exec rm -rf {} + 2>/dev/null || true
+          find . -name "*Watch*.app" -exec rm -rf {} + 2>/dev/null || true
+          find . -path "*/Payload/*.app/Watch" -exec rm -rf {} + 2>/dev/null || true
+          zip -qr ../spotify_nowatchkit.ipa Payload
+          cd ..
+          echo "Watch app eliminada."
+
       - name: Inject EeveeSpotify into IPA
         run: |
           OUTPUT_IPA="EeveeSpotify-Sideloadly.ipa"
 
           if [[ -n "$SAFARI_EXT" ]]; then
-            ivinject-arm64 spotify.ipa "$OUTPUT_IPA" \
+            ivinject-arm64 spotify_nowatchkit.ipa "$OUTPUT_IPA" \
               -i "$EEVEESPOTIFY_DEB" "$SWIFTPROTOBUF_DEB" "$SAFARI_EXT" \
               -s - -d --level Optimal
           else
-            ivinject-arm64 spotify.ipa "$OUTPUT_IPA" \
+            ivinject-arm64 spotify_nowatchkit.ipa "$OUTPUT_IPA" \
               -i "$EEVEESPOTIFY_DEB" "$SWIFTPROTOBUF_DEB" \
               -s - -d --level Optimal
           fi
