@@ -1,0 +1,164 @@
+name: Build IPA for Sideloadly
+
+on:
+  workflow_dispatch:
+    inputs:
+      spotify_ipa_url:
+        description: "URL del IPA de Spotify descifrado (decrypted)"
+        required: true
+        type: string
+      include_safari_extension:
+        description: "Incluir OpenSpotify Safari Extension"
+        required: false
+        default: true
+        type: boolean
+
+env:
+  SWIFTPROTOBUF_VERSION: "1.29.0"
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hide Sensitive Inputs
+        uses: levibostian/action-hide-sensitive-inputs@v1
+
+      - name: Download and Validate Spotify IPA
+        run: |
+          echo "Descargando Spotify IPA..."
+          wget "${{ inputs.spotify_ipa_url }}" --no-verbose -O spotify.ipa
+          file_type=$(file --mime-type -b spotify.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::El archivo descargado no es un IPA valido. Tipo detectado: $file_type"
+            exit 1
+          fi
+          echo "IPA validado correctamente."
+
+      - name: Get Latest EeveeSpotify Release
+        id: get_release
+        run: |
+          echo "Buscando el ultimo release de EeveeSpotify..."
+          RELEASE_JSON=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -H "Authorization: Bearer ${{ github.token }}")
+
+          # Buscar el .deb rootful (arm) del ultimo release
+          DEB_URL=$(echo "$RELEASE_JSON" | jq -r '
+            [.[] | .assets[] | select(.name | test("iphoneos-arm\\.deb$"))]
+            | first | .browser_download_url
+          ')
+
+          if [[ -z "$DEB_URL" || "$DEB_URL" == "null" ]]; then
+            echo "::error::No se encontro un .deb de EeveeSpotify en los releases. Asegurate de haber creado un release primero."
+            exit 1
+          fi
+
+          RELEASE_VERSION=$(echo "$RELEASE_JSON" | jq -r '
+            [.[] | select(.assets[] | .name | test("iphoneos-arm\\.deb$"))]
+            | first | .tag_name
+          ')
+
+          echo "DEB_URL=$DEB_URL" >> $GITHUB_ENV
+          echo "EEVEESPOTIFY_VERSION=$RELEASE_VERSION" >> $GITHUB_ENV
+          echo "Encontrado: $DEB_URL (version $RELEASE_VERSION)"
+
+      - name: Download EeveeSpotify DEB
+        run: |
+          wget "$DEB_URL" --no-verbose -O eeveespotify.deb
+          file_type=$(file --mime-type -b eeveespotify.deb)
+          if [[ "$file_type" != "application/vnd.debian.binary-package" ]]; then
+            echo "::error::El archivo .deb descargado no es valido. Tipo: $file_type"
+            exit 1
+          fi
+          echo "DEB validado correctamente."
+
+      - name: Download SwiftProtobuf
+        run: |
+          wget https://github.com/whoeevee/swift-protobuf/releases/download/${{ env.SWIFTPROTOBUF_VERSION }}/org.swift.protobuf.swiftprotobuf_${{ env.SWIFTPROTOBUF_VERSION }}_iphoneos-arm.deb \
+            --no-verbose -O swiftprotobuf.deb
+          echo "SWIFTPROTOBUF_DEB=swiftprotobuf.deb" >> $GITHUB_ENV
+
+      - name: Download OpenSpotify Safari Extension
+        if: ${{ inputs.include_safari_extension }}
+        run: |
+          git clone https://github.com/BillyCurtis/OpenSpotifySafariExtension --depth=1
+          echo "SAFARI_EXT=OpenSpotifySafariExtension/OpenSpotifySafariExtension.appex" >> $GITHUB_ENV
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2.0'
+
+      - name: Setup insert-dylib
+        run: |
+          git clone https://github.com/Tyilo/insert_dylib.git --depth=1
+          xcrun clang -x c -arch arm64 ./insert_dylib/insert_dylib/main.c -I/usr/include/ -o insert-dylib
+          sudo mv insert-dylib /usr/local/bin/
+          sudo chmod +x /usr/local/bin/insert-dylib
+
+      - name: Setup ivinject
+        run: |
+          git clone https://github.com/whoeevee/ivinject.git --depth=1
+          cp -r ./ivinject/KnownFrameworks ~/.ivinject
+          wget https://github.com/whoeevee/ivinject/releases/download/first/ivinject-arm64 --no-verbose
+          sudo mv ivinject-arm64 /usr/local/bin/
+          sudo chmod +x /usr/local/bin/ivinject-arm64
+
+      - name: Setup ipapatch
+        run: |
+          wget https://github.com/asdfzxcvbn/ipapatch/releases/download/v2.1.0/ipapatch.macos-arm64 --no-verbose
+          sudo mv ipapatch.macos-arm64 /usr/local/bin/ipapatch
+          sudo chmod +x /usr/local/bin/ipapatch
+
+      - name: Inject EeveeSpotify into IPA
+        run: |
+          OUTPUT_IPA="EeveeSpotify-Sideloadly.ipa"
+
+          if [[ -n "$SAFARI_EXT" ]]; then
+            ivinject-arm64 spotify.ipa "$OUTPUT_IPA" \
+              -i eeveespotify.deb "$SWIFTPROTOBUF_DEB" "$SAFARI_EXT" \
+              -s - -d --level Optimal
+          else
+            ivinject-arm64 spotify.ipa "$OUTPUT_IPA" \
+              -i eeveespotify.deb "$SWIFTPROTOBUF_DEB" \
+              -s - -d --level Optimal
+          fi
+
+          echo "OUTPUT_IPA=$OUTPUT_IPA" >> $GITHUB_ENV
+          echo "IPA generado: $OUTPUT_IPA"
+
+      - name: Create Patched IPA (para Sideloadly sin JB)
+        run: |
+          PATCHED_IPA="EeveeSpotify-Sideloadly-patched.ipa"
+          ipapatch -input "$OUTPUT_IPA" -output "$PATCHED_IPA"
+          echo "PATCHED_IPA=$PATCHED_IPA" >> $GITHUB_ENV
+
+      - name: Upload IPA como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EeveeSpotify-Sideloadly-${{ env.EEVEESPOTIFY_VERSION }}
+          path: |
+            ${{ env.OUTPUT_IPA }}
+            ${{ env.PATCHED_IPA }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Instrucciones de instalacion
+        run: |
+          echo ""
+          echo "============================================"
+          echo "  IPA listo para Sideloadly!"
+          echo "============================================"
+          echo ""
+          echo "Archivos generados:"
+          echo "  - EeveeSpotify-Sideloadly.ipa       (para TrollStore)"
+          echo "  - EeveeSpotify-Sideloadly-patched.ipa (para Sideloadly con cuenta gratuita)"
+          echo ""
+          echo "Pasos para instalar:"
+          echo "  1. Descarga el artifact de este workflow"
+          echo "  2. Abre Sideloadly en tu PC/Mac"
+          echo "  3. Arrastra el archivo -patched.ipa a Sideloadly"
+          echo "  4. Conecta tu iPhone/iPad y haz clic en Start"
+          echo "  5. Ingresa tu Apple ID cuando se te pida"
+          echo ""
