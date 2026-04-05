@@ -2,80 +2,168 @@ import cv2
 import face_recognition
 import numpy as np
 import time
+import threading
 from face_db import FaceDatabase
 
 # --- Config ---
-RECOGNITION_THRESHOLD = 0.45   # Mas estricto = mas preciso
-PROCESS_EVERY_N_FRAMES = 2     # Cada 2 frames para mayor fluidez
-SCAN_SAMPLES = 20              # Muestras a capturar al guardar una cara
-SCAN_SECONDS = 3.0             # Duracion del escaneo en segundos
-NUM_JITTERS = 3                # Repeticiones internas para mayor precision (mas lento pero mejor)
-DB_PATH = "faces_db.sqlite"
+RECOGNITION_THRESHOLD = 0.45
+SCAN_SAMPLES     = 15      # muestras al guardar
+NUM_JITTERS_LIVE = 1       # rapido para el video en vivo
+NUM_JITTERS_SCAN = 10      # preciso al escanear para guardar
+SCALE            = 0.25    # escalar mas pequeno = deteccion mas rapida
+DB_PATH          = "faces_db.sqlite"
 
 COLOR_KNOWN   = (0, 220, 0)
 COLOR_UNKNOWN = (0, 100, 255)
 COLOR_TEXT    = (255, 255, 255)
 COLOR_SCAN    = (0, 220, 220)
+COLOR_DELETE  = (0, 60, 220)
 
 
-def lerp(a, b, t):
-    return int(a + (b - a) * t)
+# ── Hilo de reconocimiento ──────────────────────────────────────────────────
+
+class RecognitionThread(threading.Thread):
+    def __init__(self, db):
+        super().__init__(daemon=True)
+        self.db = db
+        self._lock = threading.Lock()
+        self._frame = None
+        self._results = []
+        self._known_faces = db.load_all_faces()
+        self._stop_evt = threading.Event()
+        self._prev_bboxes = {}
+
+    def update_frame(self, frame):
+        with self._lock:
+            self._frame = frame
+
+    def get_results(self):
+        with self._lock:
+            return list(self._results)
+
+    def reload_faces(self):
+        with self._lock:
+            self._known_faces = self.db.load_all_faces()
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def _lerp_bbox(self, prev, curr, alpha=0.4):
+        if prev is None:
+            return curr
+        return tuple(int(p + (c - p) * alpha) for p, c in zip(prev, curr))
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            with self._lock:
+                frame = self._frame
+                known = list(self._known_faces)
+
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            small = cv2.resize(frame, (0, 0), fx=SCALE, fy=SCALE)
+            rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+
+            locs  = face_recognition.face_locations(rgb)
+            encs  = face_recognition.face_encodings(rgb, locs, num_jitters=NUM_JITTERS_LIVE)
+
+            known_encs = [f["encoding"] for f in known]
+            results    = []
+            seen_names = set()
+
+            for loc, enc in zip(locs, encs):
+                top, right, bottom, left = [int(v / SCALE) for v in loc]
+                raw_bbox = (top, right, bottom, left)
+
+                label = "Desconocido"
+                color = COLOR_UNKNOWN
+                sim   = None
+                fid   = None
+
+                if known_encs:
+                    dists    = face_recognition.face_distance(known_encs, enc)
+                    best_idx = int(np.argmin(dists))
+                    best_d   = dists[best_idx]
+                    if best_d <= RECOGNITION_THRESHOLD:
+                        m     = known[best_idx]
+                        label = m["name"]
+                        color = COLOR_KNOWN
+                        sim   = 1.0 - best_d
+                        fid   = m["id"]
+                        self.db.log_sighting(m["id"], loc)
+
+                key  = label if label != "Desconocido" else f"unk_{len(seen_names)}"
+                seen_names.add(key)
+                bbox = self._lerp_bbox(self._prev_bboxes.get(key), raw_bbox)
+                self._prev_bboxes[key] = bbox
+
+                results.append({"bbox": bbox, "label": label,
+                                 "color": color, "sim": sim, "id": fid})
+
+            active = {r["label"] if r["label"] != "Desconocido"
+                      else f"unk_{i}" for i, r in enumerate(results)}
+            self._prev_bboxes = {k: v for k, v in self._prev_bboxes.items()
+                                 if k in active}
+
+            with self._lock:
+                self._results = results
 
 
-def smooth_bbox(prev, curr, alpha=0.4):
-    if prev is None:
-        return curr
-    return tuple(lerp(p, c, alpha) for p, c in zip(prev, curr))
+# ── Dibujo ──────────────────────────────────────────────────────────────────
 
-
-def draw_bbox(frame, top, right, bottom, left, label, color, similarity=None):
+def draw_bbox(frame, bbox, label, color, sim=None):
+    top, right, bottom, left = bbox
     cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-    corner = 10
+    sz = 12
     for (x, y) in [(left, top), (right, top), (left, bottom), (right, bottom)]:
-        dx = 1 if x == left else -1
-        dy = 1 if y == top else -1
-        cv2.line(frame, (x, y), (x + dx * corner, y), color, 3)
-        cv2.line(frame, (x, y), (x, y + dy * corner), color, 3)
+        dx = sz if x == left else -sz
+        dy = sz if y == top  else -sz
+        cv2.line(frame, (x, y), (x + dx, y), color, 3)
+        cv2.line(frame, (x, y), (x, y + dy), color, 3)
 
-    label_text = label
-    if similarity is not None:
-        label_text += f"  {similarity:.0%}"
-    label_size, _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_DUPLEX, 0.65, 1)
-    cv2.rectangle(frame, (left, top - 24), (left + label_size[0] + 8, top), color, cv2.FILLED)
-    cv2.putText(frame, label_text, (left + 4, top - 6),
+    text = label + (f"  {sim:.0%}" if sim is not None else "")
+    sz2, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 0.65, 1)
+    cv2.rectangle(frame, (left, top - 26), (left + sz2[0] + 8, top), color, cv2.FILLED)
+    cv2.putText(frame, text, (left + 4, top - 7),
                 cv2.FONT_HERSHEY_DUPLEX, 0.65, COLOR_TEXT, 1)
 
 
-def draw_scan_overlay(frame, progress: float, samples: int):
+def draw_scan_overlay(frame, progress, samples):
     h, w = frame.shape[:2]
     cx, cy = w // 2, h // 2
-    radius = 90
-    angle = int(360 * progress)
-    cv2.ellipse(frame, (cx, cy), (radius, radius), -90, 0, angle, COLOR_SCAN, 4)
-    cv2.circle(frame, (cx, cy), radius - 8, (0, 0, 0), cv2.FILLED)
-    text = "Escaneando..."
-    sub  = f"{samples}/{SCAN_SAMPLES} muestras"
-    ts, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-    ss, _ = cv2.getTextSize(sub,  cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-    cv2.putText(frame, text, (cx - ts[0]//2, cy - 8),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_SCAN, 2)
-    cv2.putText(frame, sub,  (cx - ss[0]//2, cy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1)
+    r = 100
+    cv2.ellipse(frame, (cx, cy), (r, r), -90, 0, int(360 * progress), COLOR_SCAN, 5)
+    cv2.circle(frame, (cx, cy), r - 10, (0, 0, 0), cv2.FILLED)
+    t1 = "Escaneando..."
+    t2 = f"{samples}/{SCAN_SAMPLES} muestras"
+    for i, (t, sc, th) in enumerate([(t1, 0.75, 2), (t2, 0.52, 1)]):
+        sz, _ = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, sc, th)
+        y = cy - 10 + i * 28
+        cv2.putText(frame, t, (cx - sz[0]//2, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, sc,
+                    COLOR_SCAN if i == 0 else COLOR_TEXT, th)
 
 
-def draw_hud(frame, total_faces: int, detected: int):
+def draw_hud(frame, db_count, detected):
     h, w = frame.shape[:2]
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, h - 44), (w, h), (15, 15, 15), cv2.FILLED)
-    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
-    status = "  [S] Guardar cara  |  [L] Listar  |  [Q] Salir"
-    cv2.putText(frame, status, (10, h - 13), cv2.FONT_HERSHEY_SIMPLEX, 0.48, COLOR_TEXT, 1)
-    info = f"DB: {total_faces} caras  |  En camara: {detected}"
-    cv2.putText(frame, info, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 2)
+    ov = frame.copy()
+    cv2.rectangle(ov, (0, h - 44), (w, h), (15, 15, 15), cv2.FILLED)
+    cv2.addWeighted(ov, 0.65, frame, 0.35, 0, frame)
+    cv2.putText(frame, "  [S] Guardar  [D] Eliminar  [L] Listar  [Q] Salir",
+                (10, h - 13), cv2.FONT_HERSHEY_SIMPLEX, 0.48, COLOR_TEXT, 1)
+    cv2.putText(frame, f"DB: {db_count} caras  |  En camara: {detected}",
+                (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 2)
 
 
-def capture_face_encoding(cap, loc_small):
+# ── Escaneo multi-muestra ────────────────────────────────────────────────────
+
+def scan_face(cap):
     encodings = []
     start = time.time()
-    while len(encodings) < SCAN_SAMPLES:
+    timeout = 10.0
+    while len(encodings) < SCAN_SAMPLES and (time.time() - start) < timeout:
         ret, frame = cap.read()
         if not ret:
             break
@@ -83,116 +171,49 @@ def capture_face_encoding(cap, loc_small):
         rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         locs  = face_recognition.face_locations(rgb)
         if locs:
-            encs = face_recognition.face_encodings(rgb, locs, num_jitters=NUM_JITTERS)
+            encs = face_recognition.face_encodings(rgb, locs[:1], num_jitters=NUM_JITTERS_SCAN)
             if encs:
                 encodings.append(encs[0])
-
-        progress = len(encodings) / SCAN_SAMPLES
-        display  = frame.copy()
-        draw_scan_overlay(display, progress, len(encodings))
+        prog    = len(encodings) / SCAN_SAMPLES
+        display = frame.copy()
+        draw_scan_overlay(display, prog, len(encodings))
         cv2.imshow("Face Tracker", display)
         cv2.waitKey(1)
 
-        if time.time() - start > SCAN_SECONDS * 2:
-            break
+    return np.mean(encodings, axis=0) if encodings else None
 
-    if not encodings:
-        return None
-    return np.mean(encodings, axis=0)
 
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    db = FaceDatabase(DB_PATH)
+    db  = FaceDatabase(DB_PATH)
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
     if not cap.isOpened():
         print("Error: no se pudo abrir la camara.")
         return
 
     print("Face Tracker iniciado.")
-    print("  S -> escanear y guardar cara (3 seg, 20 muestras)")
-    print("  L -> listar caras guardadas")
-    print("  Q -> salir\n")
+    print("  S -> guardar cara  |  D -> eliminar cara  |  L -> listar  |  Q -> salir\n")
 
-    known_faces  = db.load_all_faces()
-    frame_count  = 0
-    prev_bboxes  = {}
-
-    face_locations    = []
-    face_labels       = []
-    face_colors       = []
-    face_similarities = []
-    face_ids          = []
+    rt = RecognitionThread(db)
+    rt.start()
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame_count += 1
-        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        rgb_small   = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        rt.update_frame(frame)
+        results = rt.get_results()
 
-        if frame_count % PROCESS_EVERY_N_FRAMES == 0:
-            locs      = face_recognition.face_locations(rgb_small)
-            encodings = face_recognition.face_encodings(rgb_small, locs, num_jitters=NUM_JITTERS)
+        for r in results:
+            draw_bbox(frame, r["bbox"], r["label"], r["color"], r["sim"])
 
-            new_locations     = []
-            new_labels        = []
-            new_colors        = []
-            new_similarities  = []
-            new_ids           = []
-
-            known_encodings = [f["encoding"] for f in known_faces]
-
-            for idx, (loc, enc) in enumerate(zip(locs, encodings)):
-                top, right, bottom, left = [v * 2 for v in loc]
-                raw_bbox = (top, right, bottom, left)
-                smooth   = smooth_bbox(prev_bboxes.get(idx), raw_bbox, alpha=0.35)
-                prev_bboxes[idx] = smooth
-                new_locations.append(smooth)
-
-                if known_encodings:
-                    distances = face_recognition.face_distance(known_encodings, enc)
-                    best_idx  = int(np.argmin(distances))
-                    best_dist = distances[best_idx]
-
-                    if best_dist <= RECOGNITION_THRESHOLD:
-                        match = known_faces[best_idx]
-                        new_labels.append(match["name"])
-                        new_colors.append(COLOR_KNOWN)
-                        new_similarities.append(1.0 - best_dist)
-                        new_ids.append(match["id"])
-                        db.log_sighting(match["id"], loc)
-                    else:
-                        new_labels.append("Desconocido")
-                        new_colors.append(COLOR_UNKNOWN)
-                        new_similarities.append(None)
-                        new_ids.append(None)
-                else:
-                    new_labels.append("Desconocido")
-                    new_colors.append(COLOR_UNKNOWN)
-                    new_similarities.append(None)
-                    new_ids.append(None)
-
-            prev_bboxes = {i: v for i, v in prev_bboxes.items() if i < len(locs)}
-
-            face_locations    = new_locations
-            face_labels       = new_labels
-            face_colors       = new_colors
-            face_similarities = new_similarities
-            face_ids          = new_ids
-
-        for i, bbox in enumerate(face_locations):
-            top, right, bottom, left = bbox
-            label = face_labels[i]       if i < len(face_labels)       else "?"
-            color = face_colors[i]       if i < len(face_colors)       else COLOR_UNKNOWN
-            sim   = face_similarities[i] if i < len(face_similarities) else None
-            draw_bbox(frame, top, right, bottom, left, label, color, sim)
-
-        draw_hud(frame, db.get_face_count(), len(face_locations))
+        draw_hud(frame, db.get_face_count(), len(results))
         cv2.imshow("Face Tracker", frame)
 
         key = cv2.waitKey(1) & 0xFF
@@ -201,30 +222,36 @@ def main():
             break
 
         elif key == ord('s'):
-            unknown_indices = [i for i, lbl in enumerate(face_labels) if lbl == "Desconocido"]
-            if not unknown_indices:
+            unknown = [r for r in results if r["label"] == "Desconocido"]
+            if not unknown:
                 print("No hay caras desconocidas en pantalla.")
                 continue
-
-            idx = unknown_indices[0]
-            loc = face_locations[idx]
-            small_loc = tuple(v // 2 for v in loc)
-
-            print(f"\nEscaneando cara... ({SCAN_SAMPLES} muestras)")
-            avg_encoding = capture_face_encoding(cap, small_loc)
-
-            if avg_encoding is None:
+            print(f"\nEscaneando... ({SCAN_SAMPLES} muestras, mantente quieto)")
+            enc = scan_face(cap)
+            if enc is None:
                 print("  No se pudo escanear. Intentalo de nuevo.")
                 continue
+            print(f"Nombre (DB tiene {db.get_face_count()} caras):")
+            name = input("  Nombre: ").strip() or f"Persona_{db.get_face_count() + 1}"
+            fid  = db.save_face(name, enc)
+            print(f"  Guardado: {name} (ID {fid})\n")
+            rt.reload_faces()
 
-            print(f"Nombre para la nueva cara (DB tiene {db.get_face_count()} caras):")
-            name = input("  Nombre: ").strip()
-            if not name:
-                name = f"Persona_{db.get_face_count() + 1}"
-
-            face_id = db.save_face(name, avg_encoding)
-            print(f"  Guardado: {name} (ID {face_id}, {SCAN_SAMPLES} muestras promediadas)\n")
-            known_faces = db.load_all_faces()
+        elif key == ord('d'):
+            faces = db.list_faces()
+            if not faces:
+                print("No hay caras guardadas.")
+                continue
+            print("\n--- Caras guardadas ---")
+            for f in faces:
+                print(f"  [{f['id']}] {f['name']}  |  {f['created_at'][:10]}  |  {f['sightings']} avistamientos")
+            try:
+                fid = int(input("  ID a eliminar (Enter para cancelar): ").strip())
+                db.delete_face(fid)
+                print(f"  Cara ID {fid} eliminada.\n")
+                rt.reload_faces()
+            except (ValueError, EOFError):
+                print("  Cancelado.\n")
 
         elif key == ord('l'):
             print("\n--- Caras guardadas ---")
@@ -232,6 +259,7 @@ def main():
                 print(f"  [{f['id']}] {f['name']}  |  {f['created_at'][:10]}  |  {f['sightings']} avistamientos")
             print()
 
+    rt.stop()
     cap.release()
     cv2.destroyAllWindows()
     print("Face Tracker cerrado.")
