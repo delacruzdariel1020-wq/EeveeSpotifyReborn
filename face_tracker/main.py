@@ -33,16 +33,18 @@ class RecognitionThread(threading.Thread):
     def __init__(self, db):
         super().__init__(daemon=True)
         self.db = db
-        self._lock  = threading.Lock()
-        self._frame = None
+        self._lock   = threading.Lock()
+        self._frame  = None
         self._results = []
-        self._known   = db.load_all_faces()
+        self._known  = db.load_all_faces()
         self._running = True
         self._smooth  = {}
+        self._active  = threading.Event()
+        self._active.set()
 
     def feed(self, frame):
         with self._lock:
-            self._frame = frame
+            self._frame = frame.copy()
 
     def results(self):
         with self._lock:
@@ -53,6 +55,13 @@ class RecognitionThread(threading.Thread):
             self._known = self.db.load_all_faces()
             self._smooth.clear()
 
+    def pause(self):
+        self._active.clear()
+        time.sleep(0.05)
+
+    def resume(self):
+        self._active.set()
+
     def stop(self):
         self._running = False
 
@@ -62,6 +71,9 @@ class RecognitionThread(threading.Thread):
 
     def run(self):
         while self._running:
+            if not self._active.wait(timeout=0.1):
+                continue
+
             with self._lock:
                 frame = self._frame
                 known = list(self._known)
@@ -104,7 +116,7 @@ class RecognitionThread(threading.Thread):
                 self._results = out
 
 
-# ── Helpers de dibujo ────────────────────────────────────────────────────────
+# ── Dibujo ────────────────────────────────────────────────────────────────────
 
 def overlay_rect(frame, x1, y1, x2, y2, color=C_DARK, alpha=0.72):
     x1, y1 = max(0, x1), max(0, y1)
@@ -135,18 +147,17 @@ def draw_face(frame, bbox, label, color, sim):
     put(frame, txt, l + 5, t - 8, 0.65, C_WHITE)
 
 
-def draw_hud(frame, db_count, n):
+def draw_hud(frame, db_count, n_faces):
     h, w = frame.shape[:2]
     overlay_rect(frame, 0, h - 40, w, h)
-    put(frame, "S Guardar   D Eliminar   L Listar   Q/Esc Salir",
-        10, h - 12, 0.47, C_WHITE)
-    put(frame, f"DB: {db_count}   Detectadas: {n}", 10, 28, 0.62, C_WHITE, 2)
+    put(frame, "S Guardar   D Eliminar   L Listar   Q Salir", 10, h - 12, 0.47, C_WHITE)
+    put(frame, f"DB: {db_count}   Detectadas: {n_faces}", 10, 28, 0.62, C_WHITE, 2)
 
 
 def draw_scan_progress(frame, prog, n):
     h, w = frame.shape[:2]
     cx, cy, r = w // 2, h // 2, 90
-    overlay_rect(frame, cx - r - 20, cy - r - 20, cx + r + 20, cy + r + 40, alpha=0.65)
+    overlay_rect(frame, cx - r - 20, cy - r - 20, cx + r + 20, cy + r + 40, alpha=0.6)
     cv2.ellipse(frame, (cx, cy), (r, r), -90, 0, int(360 * prog), C_CYAN, 5, cv2.LINE_AA)
     cv2.circle(frame, (cx, cy), r - 10, C_DARK, cv2.FILLED)
     for i, (txt, sc) in enumerate([("Escaneando...", 0.75), (f"{n} / {SCAN_SAMPLES}", 0.55)]):
@@ -155,13 +166,13 @@ def draw_scan_progress(frame, prog, n):
             C_CYAN if i == 0 else C_WHITE, 2, cv2.FONT_HERSHEY_SIMPLEX)
 
 
-def draw_typing(frame, typed):
+def draw_typing(frame, typed_name):
     h, w = frame.shape[:2]
     overlay_rect(frame, 0, h // 2 - 55, w, h // 2 + 58, alpha=0.88)
     put(frame, "Nombre de la persona:", 20, h // 2 - 18, 0.65, C_CYAN, 1,
         cv2.FONT_HERSHEY_SIMPLEX)
     cur = "_" if int(time.time() * 2) % 2 == 0 else " "
-    put(frame, typed + cur, 20, h // 2 + 24, 0.9, C_WHITE, 2,
+    put(frame, typed_name + cur, 20, h // 2 + 24, 0.9, C_WHITE, 2,
         cv2.FONT_HERSHEY_SIMPLEX)
     put(frame, "Enter confirmar   Esc cancelar", 20, h // 2 + 50,
         0.45, C_WHITE, 1, cv2.FONT_HERSHEY_SIMPLEX)
@@ -186,7 +197,7 @@ def draw_delete_menu(frame, faces, sel):
 
 # ── Escaneo ────────────────────────────────────────────────────────────────────
 
-def scan_encoding(cap):
+def scan_encoding(cap, frame_cb):
     encodings, start = [], time.time()
     while len(encodings) < SCAN_SAMPLES and (time.time() - start) < 12:
         ret, frame = cap.read()
@@ -196,13 +207,10 @@ def scan_encoding(cap):
         rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         locs  = face_recognition.face_locations(rgb)
         if locs:
-            encs = face_recognition.face_encodings(rgb, locs[:1],
-                                                    num_jitters=NUM_JITTERS_SCAN)
+            encs = face_recognition.face_encodings(rgb, locs[:1], num_jitters=NUM_JITTERS_SCAN)
             if encs:
                 encodings.append(encs[0])
-        draw_scan_progress(frame, len(encodings) / SCAN_SAMPLES, len(encodings))
-        cv2.imshow("Face Tracker", frame)
-        cv2.waitKey(1)
+        frame_cb(frame, len(encodings) / SCAN_SAMPLES, len(encodings))
     return np.mean(encodings, axis=0) if encodings else None
 
 
@@ -235,9 +243,7 @@ def main():
         if not ret:
             break
 
-        if state == ST_SCANNING:
-            pass
-        else:
+        if state != ST_SCANNING:
             rt.feed(frame)
             res = rt.results()
             for r in res:
@@ -251,9 +257,10 @@ def main():
         cv2.imshow("Face Tracker", frame)
         key = cv2.waitKey(1) & 0xFF
 
-        # Esc siempre cancela / sale
         if key == 27:
             if state != ST_NORMAL:
+                if state == ST_SCANNING:
+                    rt.resume()
                 state, typed_name, pending_enc = ST_NORMAL, "", None
             else:
                 break
@@ -263,43 +270,56 @@ def main():
                 break
             elif key == ord('s'):
                 res = rt.results()
-                if any(r["label"] == "Desconocido" for r in res):
-                    state = ST_SCANNING
-                    enc   = scan_encoding(cap)
-                    if enc is not None:
-                        pending_enc, typed_name, state = enc, "", ST_TYPING
-                    else:
-                        state = ST_NORMAL
+                if not any(r["label"] == "Desconocido" for r in res):
+                    continue
+                rt.pause()   # detener dlib en hilo antes de usarlo aqui
+                state = ST_SCANNING
+
+                def progress_cb(f, prog, n):
+                    draw_scan_progress(f, prog, n)
+                    cv2.imshow("Face Tracker", f)
+                    cv2.waitKey(1)
+
+                enc = scan_encoding(cap, progress_cb)
+                rt.resume()  # reanudar hilo
+                if enc is not None:
+                    pending_enc, typed_name, state = enc, "", ST_TYPING
+                else:
+                    state = ST_NORMAL
+
             elif key == ord('d'):
                 del_faces = db.list_faces()
                 if del_faces:
                     del_sel, state = 0, ST_DELETE
+
             elif key == ord('l'):
                 print("\n--- Caras guardadas ---")
                 for f in db.list_faces():
-                    print(f"  [{f['id']}] {f['name']}  "
-                          f"{f['created_at'][:10]}  {f['sightings']} avist.")
+                    print(f"  [{f['id']}] {f['name']}  {f['created_at'][:10]}  {f['sightings']} avist.")
                 print()
 
         elif state == ST_TYPING:
-            if key == 13:  # Enter
+            if key == 13:
                 name = typed_name.strip() or f"Persona_{db.get_face_count() + 1}"
-                fid  = db.save_face(name, pending_enc)
-                print(f"Guardado: {name} (ID {fid})")
-                rt.reload()
+                try:
+                    fid = db.save_face(name, pending_enc)
+                    print(f"Guardado: {name} (ID {fid})")
+                    rt.reload()
+                except Exception as e:
+                    print(f"Error al guardar: {e}")
                 state, typed_name, pending_enc = ST_NORMAL, "", None
-            elif key == 8:   # Backspace
+            elif key == 8:
                 typed_name = typed_name[:-1]
             elif 32 <= key <= 126:
                 typed_name += chr(key)
 
         elif state == ST_DELETE:
-            if key in (82, 72, 119, 104):   # Up arrows / w / h
+            if key in (82, 72, 119, 104):
                 del_sel = max(0, del_sel - 1)
-            elif key in (84, 80, 115, 106): # Down arrows / s / j
+            elif key in (84, 80, 115, 106):
                 del_sel = min(len(del_faces) - 1, del_sel + 1)
-            elif key == 13:  # Enter
-                f   = del_faces[del_sel]
+            elif key == 13:
+                f = del_faces[del_sel]
                 db.delete_face(f["id"])
                 print(f"Eliminado: {f['name']} (ID {f['id']})")
                 rt.reload()
